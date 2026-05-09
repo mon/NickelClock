@@ -2,11 +2,13 @@
 #include <cstdlib>
 
 #include <Qt>
+#include <QEvent>
 #include <QGuiApplication>
 #include <QWidget>
 #include <QHBoxLayout>
 #include <QFile>
 #include <QLabel>
+#include <QPointer>
 #include <QVariant>
 #include <QSettings>
 #include <QMargins>
@@ -27,6 +29,7 @@ const char* battery_cap_files[] = {
 };
 
 NC *nc = nullptr;
+static QPointer<QWidget> nc_reading_view;
 
 // This is somewhat arbitrary, but seems a good place to get
 // access to the ReadingView after it has been created.
@@ -36,6 +39,7 @@ TimeLabel *(*TimeLabel__TimeLabel)(TimeLabel *_this, QWidget *parent);
 
 HardwareInterface *(*HardwareFactory__sharedInstance)();
 N3BatteryStatusLabel *(*N3BatteryStatusLabel__N3BatteryStatusLabel)(N3BatteryStatusLabel* _this, QWidget *parent);
+QWidget *(*InlineDictionaryView__InlineDictionaryView)(QWidget *_this, const void *volume, const void *contentSettings, QWidget *parent);
 
 static struct nh_info NickelClock = {
     .name           = "NickelClock",
@@ -47,11 +51,18 @@ static struct nh_info NickelClock = {
 
 static struct nh_hook NickelClockHook[] = {
     {
-        .sym     = "_ZN11ReadingView19readerIsDoneLoadingEv", 
+        .sym     = "_ZN11ReadingView19readerIsDoneLoadingEv",
         .sym_new = "_nc_set_header_clock",
         .lib     = "libnickel.so.1.0.0",
         .out     = nh_symoutptr(ReadingView__ReaderIsDoneLoading),
         .desc    = "footer progress update"
+    },
+    {
+        .sym     = "_ZN20InlineDictionaryViewC1ERK6VolumeRK15ContentSettingsP7QWidget",
+        .sym_new = "_nc_idv_ctor",
+        .lib     = "libnickel.so.1.0.0",
+        .out     = nh_symoutptr(InlineDictionaryView__InlineDictionaryView),
+        .desc    = "install destroy filter on dictionary popup"
     },
     {0},
 };
@@ -100,7 +111,7 @@ NickelHook(
     .uninstall = &nc_uninstall
 )
 
-// Older firmware versions have [newHeader=true] and [newFooter=true] as 
+// Older firmware versions have [newHeader=true] and [newFooter=true] as
 // part of their QSS selector. Create and set those properties here.
 static void set_extra_props(QWidget* w) {
     if (w) {
@@ -110,8 +121,8 @@ static void set_extra_props(QWidget* w) {
     }
 }
 
-NC::NC(QRect const& screenGeom) 
-            : QObject(nullptr), 
+NC::NC(QRect const& screenGeom)
+            : QObject(nullptr),
               settings(screenGeom),
               footerMarginRe("qproperty-footerMargin:\\s*\\d+;"),
               scrGeom(screenGeom)
@@ -151,11 +162,11 @@ QString const& NC::ncLabelStylesheet()
     return ncLblStylesheet;
 }
 
-// The ReadingFooter uses a QHBoxLayout QLayout with a single widget (the 
+// The ReadingFooter uses a QHBoxLayout QLayout with a single widget (the
 // "caption"), which is a QLabel.
-// We need to add a TimeLabel widget here, and insert some stretchable spacing 
-// to ensure that the caption remains centred. 
-void NC::addItemsToFooter(ReadingView *rv) 
+// We need to add a TimeLabel widget here, and insert some stretchable spacing
+// to ensure that the caption remains centred.
+void NC::addItemsToFooter(ReadingView *rv)
 {
     for (auto p : {Header, Footer}) {
         const char *fName = p == Header ? "header" : "footer";
@@ -184,12 +195,12 @@ void NC::addItemsToFooter(ReadingView *rv)
         auto spacing = static_cast<int>(std::round(scrGeom.width() * 0.015f));
         layout->setSpacing(spacing);
         // Both clock & battery in the same postion and placement is not allowed
-        if (settings.clockInPlacement(p) && settings.batteryInPlacement(p) 
+        if (settings.clockInPlacement(p) && settings.batteryInPlacement(p)
             && settings.clockPosition() == settings.batteryPosition()) {
                 nh_log("clock and battery level cannot share the same placement and position");
                 continue;
         }
-        
+
         bool lw = false;
         bool rw = false;
         if (settings.clockInPlacement(p)) {
@@ -221,8 +232,8 @@ void NC::addItemsToFooter(ReadingView *rv)
     }
 }
 
-// Nickel sometimes polishes the ReadingFooter widget, which overrides settable 
-// values back to their stylesheet default Therefore replace the ReadingFooter 
+// Nickel sometimes polishes the ReadingFooter widget, which overrides settable
+// values back to their stylesheet default Therefore replace the ReadingFooter
 // stylesheet with customized margins instead.
 void NC::setFooterStylesheet(ReadingFooter *rf)
 {
@@ -308,7 +319,7 @@ int NC::getBatteryLevel()
     return battery;
 }
 
-NCBatteryLabel::NCBatteryLabel(int initLevel, QString const& lbl, QWidget *parent) 
+NCBatteryLabel::NCBatteryLabel(int initLevel, QString const& lbl, QWidget *parent)
     : QLabel(parent), label(lbl)
 {
     setBatteryLevel(initLevel);
@@ -325,15 +336,45 @@ void NCBatteryLabel::setBatteryLevel(int level)
     setText(txt);
 }
 
-// On recent 4.x firmware versions, the header and footer are setup in 
-// Ui_ReadingView::setupUi(). They are ReadingFooter widgets, with names set to 
+// On recent 4.x firmware versions, the header and footer are setup in
+// Ui_ReadingView::setupUi(). They are ReadingFooter widgets, with names set to
 // "header" and "footer". This makes it easy to find them with findChild().
-extern "C" __attribute__((visibility("default"))) void _nc_set_header_clock(ReadingView *_this) 
+extern "C" __attribute__((visibility("default"))) void _nc_set_header_clock(ReadingView *_this)
 {
     nc->settings.syncSettings();
     nc->addItemsToFooter(_this);
+    nc_reading_view = _this;
     if (nc->settings.debugEnabled()) {
         nh_dump_log();
     }
     ReadingView__ReaderIsDoneLoading(_this);
+}
+
+// Kobo's patched Qt has a custom Qt::WidgetAttribute (0x83) used as a waveform
+// hint by the QPA. SelectionController::onInlineDefinitionResults sets it on
+// the ReadingView when the dictionary popup appears, but unlike the page-turn
+// path (which clears it via PanningViewMixin::exitAnimationMode at the end of
+// the animation), the popup is destroyed without any cleanup, leaving the bit
+// set. On Kaleido panels that means subsequent paints underneath the
+// ReadingView — notably our TimeLabel ticking once a minute — flush via the
+// full-color refresh waveform, producing a visible flash until the book is
+// closed and reopened.
+static constexpr Qt::WidgetAttribute kAnimationWaveformAttr = static_cast<Qt::WidgetAttribute>(0x83);
+
+class NCDictionaryCleanupFilter : public QObject {
+    public:
+        using QObject::QObject;
+        bool eventFilter(QObject *, QEvent *event) override {
+            if (event->type() == QEvent::DeferredDelete && nc_reading_view) {
+                nc_reading_view->setAttribute(kAnimationWaveformAttr, false);
+            }
+            return false;
+        }
+};
+
+extern "C" __attribute__((visibility("default"))) QWidget *_nc_idv_ctor(QWidget *_this, const void *volume, const void *contentSettings, QWidget *parent)
+{
+    QWidget *result = InlineDictionaryView__InlineDictionaryView(_this, volume, contentSettings, parent);
+    _this->installEventFilter(new NCDictionaryCleanupFilter(_this));
+    return result;
 }
