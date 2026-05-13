@@ -12,6 +12,8 @@
 #include "nc_settings.h"
 
 typedef QObject HardwareInterface;
+typedef QObject Device;
+typedef QObject SelectionController;
 typedef QWidget ReadingView;
 typedef QWidget ReadingFooter;
 typedef QLabel TimeLabel;
@@ -23,7 +25,7 @@ class NC : public QObject
     Q_OBJECT
     public:
         NCSettings settings;
-        
+
         NC(QRect const& screenGeom);
         void addItemsToFooter(ReadingView *rv);
         void setFooterStylesheet(ReadingFooter *rf);

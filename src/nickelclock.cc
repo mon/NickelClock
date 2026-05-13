@@ -13,6 +13,7 @@
 #include <QSettings>
 #include <QMargins>
 #include <QScreen>
+#include <QMetaEnum>
 
 #include "nc_common.h"
 #include "nickelclock.h"
@@ -30,6 +31,7 @@ const char* battery_cap_files[] = {
 
 NC *nc = nullptr;
 static QPointer<QWidget> nc_reading_view;
+static bool has_color_display = false;
 
 // This is somewhat arbitrary, but seems a good place to get
 // access to the ReadingView after it has been created.
@@ -39,7 +41,9 @@ TimeLabel *(*TimeLabel__TimeLabel)(TimeLabel *_this, QWidget *parent);
 
 HardwareInterface *(*HardwareFactory__sharedInstance)();
 N3BatteryStatusLabel *(*N3BatteryStatusLabel__N3BatteryStatusLabel)(N3BatteryStatusLabel* _this, QWidget *parent);
-QWidget *(*InlineDictionaryView__InlineDictionaryView)(QWidget *_this, const void *volume, const void *contentSettings, QWidget *parent);
+void (*SelectionController__selectionModeOff)(SelectionController *_this);
+Device *(*Device__getCurrentDevice)();
+bool (*Device__hasColorDisplay)(Device *_this);
 
 static struct nh_info NickelClock = {
     .name           = "NickelClock",
@@ -51,37 +55,49 @@ static struct nh_info NickelClock = {
 
 static struct nh_hook NickelClockHook[] = {
     {
-        .sym     = "_ZN11ReadingView19readerIsDoneLoadingEv",
-        .sym_new = "_nc_set_header_clock",
-        .lib     = "libnickel.so.1.0.0",
-        .out     = nh_symoutptr(ReadingView__ReaderIsDoneLoading),
-        .desc    = "footer progress update"
+        .sym      = "_ZN11ReadingView19readerIsDoneLoadingEv",
+        .sym_new  = "_nc_set_header_clock",
+        .lib      = "libnickel.so.1.0.0",
+        .out      = nh_symoutptr(ReadingView__ReaderIsDoneLoading),
+        .desc     = "footer progress update"
     },
     {
-        .sym     = "_ZN20InlineDictionaryViewC1ERK6VolumeRK15ContentSettingsP7QWidget",
-        .sym_new = "_nc_idv_ctor",
-        .lib     = "libnickel.so.1.0.0",
-        .out     = nh_symoutptr(InlineDictionaryView__InlineDictionaryView),
-        .desc    = "install destroy filter on dictionary popup"
+        .sym      = "_ZN19SelectionController16selectionModeOffEv",
+        .sym_new  = "_nc_selmode_off",
+        .lib      = "libnickel.so.1.0.0",
+        .out      = nh_symoutptr(SelectionController__selectionModeOff),
+        .desc     = "SelectionController patch"
     },
     {0},
 };
 
 static struct nh_dlsym NickelClockDlsym[] = {
     {
-        .name    = "_ZN9TimeLabelC1EP7QWidget",
-        .out     = nh_symoutptr(TimeLabel__TimeLabel),
-        .desc    = "TimeLabel::TimeLabel()"
+        .name     = "_ZN9TimeLabelC1EP7QWidget",
+        .out      = nh_symoutptr(TimeLabel__TimeLabel),
+        .desc     = "TimeLabel::TimeLabel()"
     },
     {
-        .name    = "_ZN15HardwareFactory14sharedInstanceEv",
-        .out     = nh_symoutptr(HardwareFactory__sharedInstance),
-        .desc    = "HardwareFactory::sharedInstance()"
+        .name     = "_ZN15HardwareFactory14sharedInstanceEv",
+        .out      = nh_symoutptr(HardwareFactory__sharedInstance),
+        .desc     = "HardwareFactory::sharedInstance()"
     },
     {
-        .name    = "_ZN20N3BatteryStatusLabelC1EP7QWidget",
-        .out     = nh_symoutptr(N3BatteryStatusLabel__N3BatteryStatusLabel),
-        .desc    = "N3BatteryStatusLabel::N3BatteryStatusLabel()"
+        .name     = "_ZN20N3BatteryStatusLabelC1EP7QWidget",
+        .out      = nh_symoutptr(N3BatteryStatusLabel__N3BatteryStatusLabel),
+        .desc     = "N3BatteryStatusLabel::N3BatteryStatusLabel()"
+    },
+    {
+        .name     = "_ZNK6Device15hasColorDisplayEv",
+        .out      = nh_symoutptr(Device__hasColorDisplay),
+        .desc     = "Device::hasColorDisplay()",
+        .optional = true,
+    },
+    {
+        .name     = "_ZN6Device16getCurrentDeviceEv",
+        .out      = nh_symoutptr(Device__getCurrentDevice),
+        .desc     = "Device::getCurrentDevice()",
+        .optional = true,
     },
     {0},
 };
@@ -93,6 +109,11 @@ static int nc_init()
     nc = new NC(geom);
     if (!nc)
         return 1;
+
+    if(Device__hasColorDisplay && Device__getCurrentDevice) {
+        has_color_display = Device__hasColorDisplay(Device__getCurrentDevice());
+    }
+
     return 0;
 }
 
@@ -350,31 +371,68 @@ extern "C" __attribute__((visibility("default"))) void _nc_set_header_clock(Read
     ReadingView__ReaderIsDoneLoading(_this);
 }
 
-// Kobo's patched Qt has a custom Qt::WidgetAttribute (0x83) used as a waveform
-// hint by the QPA. SelectionController::onInlineDefinitionResults sets it on
-// the ReadingView when the dictionary popup appears, but unlike the page-turn
-// path (which clears it via PanningViewMixin::exitAnimationMode at the end of
-// the animation), the popup is destroyed without any cleanup, leaving the bit
-// set. On Kaleido panels that means subsequent paints underneath the
-// ReadingView — notably our TimeLabel ticking once a minute — flush via the
-// full-color refresh waveform, producing a visible flash until the book is
-// closed and reopened.
-static constexpr Qt::WidgetAttribute kAnimationWaveformAttr = static_cast<Qt::WidgetAttribute>(0x83);
-
-class NCDictionaryCleanupFilter : public QObject {
-    public:
-        using QObject::QObject;
-        bool eventFilter(QObject *, QEvent *event) override {
-            if (event->type() == QEvent::DeferredDelete && nc_reading_view) {
-                nc_reading_view->setAttribute(kAnimationWaveformAttr, false);
-            }
-            return false;
-        }
+// On colour Kobos, SelectionController::onInlineDefinitionResults adds two
+// extra attrs (the B&W Kobos have 4, colour have 6) to the ReadingView when the
+// dictionary popup appears, which enable "full" refreshes (the ones that flash
+// the elements before redrawing) and never clears them. Because it never clears
+// them, our label that refreshes every minute also flashes every minute, which
+// is distracting.
+//
+// We hook selectionModeOff and fix this, but the attrs are custom in Kobo's Qt
+// so we need to jump through some hoops to resolve them. Don't just use
+// hardcoded ints as Qt adds more attrs over time and Kobo's extra ones might
+// shift (or not even exist on older firmware)
+static const char* const extraAttrs[] = {
+    "WA_KoboEpdUpdateModeFull",
+    "WA_KoboEpdWfModeGCC16",
 };
 
-extern "C" __attribute__((visibility("default"))) QWidget *_nc_idv_ctor(QWidget *_this, const void *volume, const void *contentSettings, QWidget *parent)
+// QObject::staticQtMetaObject is protected; re-expose it via a derived class
+// so we can look up Qt namespace enums by name on older Qt (pre-Q_NAMESPACE).
+namespace {
+struct QtMetaAccess : QObject {
+    using QObject::staticQtMetaObject;
+};
+}
+
+static const QVector<Qt::WidgetAttribute>& resolvedExtraAttrs()
 {
-    QWidget *result = InlineDictionaryView__InlineDictionaryView(_this, volume, contentSettings, parent);
-    _this->installEventFilter(new NCDictionaryCleanupFilter(_this));
-    return result;
+    static const QVector<Qt::WidgetAttribute> v = [] {
+        QVector<Qt::WidgetAttribute> r;
+
+        if(!has_color_display) {
+            nh_log("No color display, not fixing SelectionController");
+            return r;
+        }
+
+        const QMetaObject &mo = QtMetaAccess::staticQtMetaObject;
+        int enumIdx = mo.indexOfEnumerator("WidgetAttribute");
+        if (enumIdx < 0) {
+            nh_log("could not find Qt::WidgetAttribute meta enum");
+            return r;
+        }
+        QMetaEnum me = mo.enumerator(enumIdx);
+        for (auto& name : extraAttrs) {
+            bool ok = false;
+            int value = me.keyToValue(name, &ok);
+            if (ok) {
+                r.push_back(static_cast<Qt::WidgetAttribute>(value));
+                // nh_log("mapped Qt::WidgetAttribute::%s -> 0x%02X", name, value);
+            } else {
+                nh_log("unknown Qt::WidgetAttribute key: %s", name);
+            }
+        }
+        return r;
+    }();
+    return v;
+}
+
+extern "C" __attribute__((visibility("default"))) void _nc_selmode_off(SelectionController *_this)
+{
+    SelectionController__selectionModeOff(_this);
+
+    if(nc_reading_view) {
+        for(auto attr : resolvedExtraAttrs())
+            nc_reading_view->setAttribute(attr, false);
+    }
 }
